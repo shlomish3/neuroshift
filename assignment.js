@@ -1,31 +1,19 @@
 function assignShiftToRow({
   row, i, rows, scheduleSheet, nameCol, eligibleCol, neededCol,
   fairShifts, doubleAllowed, pastCounts, dynamicCaps,
-  assignmentCounts, blockedDates, sameDayAssignments, dateMap, toranMionLog, dailyAssignments
+  assignmentCounts, blockedDates, sameDayAssignments, dateMap,
+  toranMionLog, dailyAssignments, blockTypesMap,
+  empList, empHeaders
 }) {
   const [dateStr, , shiftType, currentName, rawEligibles, rawNeeded] = row;
   const rowIndex = i + 2;
-  const isEEG = shiftType === "EEG";
   const needed = parseInt(rawNeeded, 10);
-
   if (isNaN(needed) || needed < 1) return;
 
-  // ✅ Handle missing eligibles (e.g., מיון without זכאים)
-  if (!rawEligibles) {
-    Logger.log(`[${rowIndex}] Skipped: no eligibles for ${shiftType} on ${dateStr}`);
-    const warning = formatAssignmentShortWarning(0, needed);
-    scheduleSheet.getRange(rowIndex, nameCol + 1).setValue(warning);
-    scheduleSheet.getRange(rowIndex, nameCol + 1).setBackground("#FDD");
-    return;
-  }
-
-    // ✅ Use only EEG (totalNeeded is just from its row)
   const totalNeeded = needed;
-
   const preassigned = currentName
     ? currentName.split(",").map(n => n.trim()).filter(Boolean)
     : [];
-
   const isFixed = rawEligibles === "✔ קבוע";
   const remainingNeeded = totalNeeded - preassigned.length;
 
@@ -35,23 +23,37 @@ function assignShiftToRow({
     preassigned.forEach(name => {
       updateTracking(name, shiftType, dateStr, assignmentCounts, sameDayAssignments, dailyAssignments);
     });
-
     if (preassigned.length < totalNeeded) {
       const warning = `${preassigned.join(", ")} ${formatAssignmentShortWarning(preassigned.length, totalNeeded)}`;
       scheduleSheet.getRange(rowIndex, nameCol + 1).setValue(warning);
       scheduleSheet.getRange(rowIndex, nameCol + 1).setBackground("#FDD");
     }
-
     return;
   }
 
-  let eligibles = [];
-  if (rawEligibles && rawEligibles !== "✔ קבוע") {
-    eligibles = rawEligibles.split(",").map(s => s.trim()).filter(Boolean);
-  }
+  // ✅ Recompute eligibility dynamically
+  let eligibles = empList
+    .filter(empRow => {
+      const name = empRow[0];
+      const idx = empHeaders.indexOf(shiftType);
+      return idx !== -1 && empRow[idx + 1] === "✔";
+    })
+    .map(empRow => empRow[0]);
 
+  // 🧪 Apply eligibility filters
   const actualEligibles = eligibles.filter(name => {
-    if ((blockedDates[name] || new Set()).has(dateStr)) return false;
+    const blockSet = blockTypesMap?.[name]?.[dateStr] || new Set();
+    const blocksToran = blockSet.has("לא זמין לתורנות");
+    const blocksGeneral = blockSet.has("לא זמין");
+
+    if (blocksToran && ["תורן מיון", "תורן חצי", "כונן מיון"].includes(shiftType)) return false;
+    if (blocksGeneral && !["תורן מיון", "תורן חצי", "כונן מיון"].includes(shiftType)) return false;
+
+    if ((blockedDates[name] || new Set()).has(dateStr)) {
+      Logger.log(`[${rowIndex}] ⛔ ${name} is blocked on ${dateStr} via blockedDates`);
+      return false;
+    }
+
     if (hadToranMionYesterday(name, dateStr, toranMionLog, dateMap) && shiftType !== "תורן מיון") return false;
     if (!canAssignDoubleShift(name, shiftType, dateStr, rows, sameDayAssignments, doubleAllowed)) return false;
 
@@ -59,27 +61,24 @@ function assignShiftToRow({
       const assignedShifts = rows
         .filter(r => r[0] === dateStr && (r[3] || "").includes(name))
         .map(r => r[2]);
-
       if (
         (shiftType === "כונן מיון" && assignedShifts.includes("בכיר מיון")) ||
         (shiftType === "בכיר מיון" && assignedShifts.includes("כונן מיון"))
       ) {
         // allowed
-      } else if (!doubleAllowed.has(shiftType)) {
-        return false;
-      }
+      } else if (!doubleAllowed.has(shiftType)) return false;
     }
 
     const cap = dynamicCaps[shiftType]?.[name] ?? Infinity;
     const total = getShiftTotalLoad(name, shiftType, assignmentCounts, pastCounts);
     if (fairShifts.includes(shiftType) && total >= cap) return false;
+
     return true;
   });
 
   Logger.log(`[${rowIndex}] Actual eligibles for ${shiftType} on ${dateStr}: ${actualEligibles.join(", ")}`);
 
   if (shiftType === "תורן מיון" && actualEligibles.length === 0) {
-    Logger.log(`⚠️ No one eligible for תורן מיון on ${dateStr}`);
     scheduleSheet.getRange(rowIndex, nameCol + 1).setValue("⚠️ חסר שיבוץ");
     scheduleSheet.getRange(rowIndex, nameCol + 1).setBackground("#FDD");
     return;
@@ -87,9 +86,15 @@ function assignShiftToRow({
 
   scheduleSheet.getRange(rowIndex, eligibleCol + 1).setValue(actualEligibles.join(", "));
 
-  actualEligibles.sort((a, b) => getShiftTotalLoad(a, shiftType, assignmentCounts, pastCounts) - getShiftTotalLoad(b, shiftType, assignmentCounts, pastCounts));
+  actualEligibles.sort((a, b) =>
+    getShiftTotalLoad(a, shiftType, assignmentCounts, pastCounts) -
+    getShiftTotalLoad(b, shiftType, assignmentCounts, pastCounts)
+  );
+
   const lowestLoad = getShiftTotalLoad(actualEligibles[0], shiftType, assignmentCounts, pastCounts);
-  const lowestGroup = actualEligibles.filter(name => getShiftTotalLoad(name, shiftType, assignmentCounts, pastCounts) === lowestLoad);
+  const lowestGroup = actualEligibles.filter(name =>
+    getShiftTotalLoad(name, shiftType, assignmentCounts, pastCounts) === lowestLoad
+  );
   shuffleArray(lowestGroup);
   const fallback = actualEligibles.slice(lowestGroup.length);
   const finalPool = [...lowestGroup, ...fallback];
@@ -124,14 +129,18 @@ function assignShiftToRow({
 
   combined.forEach(name => {
     updateTracking(name, shiftType, dateStr, assignmentCounts, sameDayAssignments, dailyAssignments);
+
     if (shiftType === "תורן מיון") {
       if (!toranMionLog[name]) toranMionLog[name] = [];
       toranMionLog[name].push(dateStr);
-      const nextDate = dateMap[i + 1];
-      if (nextDate) {
-        if (!blockedDates[name]) blockedDates[name] = new Set();
-        blockedDates[name].add(nextDate);
-      }
+
+      const nextDay = new Date(dateStr);
+      nextDay.setDate(nextDay.getDate() + 1);
+      const nextStr = Utilities.formatDate(nextDay, Session.getScriptTimeZone(), "yyyy-MM-dd");
+
+      if (!blockedDates[name]) blockedDates[name] = new Set();
+      blockedDates[name].add(nextStr);
+      Logger.log(`🚫 ${name} blocked for תורן מיון on ${nextStr}`);
     }
   });
 }

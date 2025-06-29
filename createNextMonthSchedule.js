@@ -153,5 +153,12 @@ function createNextMonthSchedule() {
     }
   }
 
+  // Force sheet changes to commit before using the data
+  SpreadsheetApp.flush();
+
+  //Copying Attending from אטנדינג tab to שיבוצים קבועים
+  appendAttendingsToFixedAssignments(newSheet, ss.getSpreadsheetTimeZone());
+
+
   Logger.log(`המשמרות לחודש ${yearMonth} נוצרו בהצלחה!`);
 }

@@ -21,20 +21,6 @@ function fillEligibility() {
   const parsedData = parsedSheet.getDataRange().getValues();
   const parsedRows = parsedData.slice(1); // skip header
 
-  // Build a map: name -> Set of unavailable date strings (yyyy-MM-dd)
-  const unavailabilityMap = {};
-  parsedRows.forEach(([name, dateStr, , type]) => {
-    if (!name || !dateStr) return;
-    const normalized = Utilities.formatDate(new Date(dateStr), tz, "yyyy-MM-dd");
-    const blockType = String(type || "");
-    // Only mark actual blocking types
-    const isBlocking = blockType.includes("לא זמין");
-    if (isBlocking) {
-      if (!unavailabilityMap[name]) unavailabilityMap[name] = new Set();
-      unavailabilityMap[name].add(normalized);
-    }
-  });
-
   const fixedSheet = ss.getSheetByName("שיבוצים קבועים");
   const fixedRules = fixedSheet ? fixedSheet.getDataRange().getValues().slice(1) : [];
 
@@ -48,10 +34,33 @@ function fillEligibility() {
     if (isNaN(needed) || needed === 0) return;
 
     const shiftColIndex = empHeaders.indexOf(shiftType);
-    const eligible = (shiftColIndex === -1) ? [] : empList
-      .filter(emp => (emp[shiftColIndex + 1] === 1 || emp[shiftColIndex + 1] === "1"))
-      .map(emp => emp[0])
-      .filter(name => !(unavailabilityMap[name] || new Set()).has(dateFormatted));
+    if (shiftColIndex === -1) return;
+
+    const eligible = empList
+      .filter(emp => {
+        const name = emp[0];
+        const isEligible = emp[shiftColIndex + 1] === 1 || emp[shiftColIndex + 1] === "1";
+        if (!isEligible) return false;
+
+        // Find all blocking types for this user/date
+        const blockTypes = parsedRows
+          .filter(([n, d]) => n === name && Utilities.formatDate(new Date(d), tz, "yyyy-MM-dd") === dateFormatted)
+          .map(([, , , type]) => String(type || ""));
+
+        const blocksToran = blockTypes.includes("לא זמין לתורנות");
+        const blocksGeneral = blockTypes.includes("לא זמין");
+
+        if (blocksToran && ["תורן מיון", "תורן חצי", "כונן מיון"].includes(shiftType)) {
+          return false;
+        }
+
+        if (blocksGeneral && !["תורן מיון", "תורן חצי", "כונן מיון"].includes(shiftType)) {
+          return false;
+        }
+
+        return true;
+      })
+      .map(emp => emp[0]);
 
     const fixed = fixedRules.find(r => {
       if (!r[0] || !r[1] || !r[2] || !r[3]) return false;
@@ -63,20 +72,28 @@ function fillEligibility() {
 
     if (fixed) {
       const fixedName = fixed[3];
-      const blocked = unavailabilityMap[fixedName] || new Set();
 
-      if (blocked.has(dateFormatted)) {
+      // Apply the same block logic to fixed names
+      const blockTypes = parsedRows
+        .filter(([n, d]) => n === fixedName && Utilities.formatDate(new Date(d), tz, "yyyy-MM-dd") === dateFormatted)
+        .map(([, , , type]) => String(type || ""));
+
+      const blocksToran = blockTypes.includes("לא זמין לתורנות");
+      const blocksGeneral = blockTypes.includes("לא זמין");
+
+      if (
+        (blocksToran && ["תורן מיון", "תורן חצי", "כונן מיון"].includes(shiftType)) ||
+        (blocksGeneral && !["תורן מיון", "תורן חצי", "כונן מיון"].includes(shiftType))
+      ) {
         Logger.log(`❌ שיבוץ קבוע עבור ${fixedName} ב-${dateFormatted} נדחה (חסם זמינות)`);
         return;
       }
 
-      // 🟢 Write fixed name visibly
-      scheduleSheet.getRange(rowIndex, 4).setValue(`${fixedName} (קבוע)`);
+      const markAsFixed = !["תורן מיון", "כונן מיון", "תורן חצי"].includes(shiftType);
+      scheduleSheet.getRange(rowIndex, 4).setValue(markAsFixed ? `${fixedName} (קבוע)` : fixedName);
 
-      // 🟢 Add fixedName to eligibility list if not already present
       const fullEligibility = Array.from(new Set([fixedName, ...eligible]));
       scheduleSheet.getRange(rowIndex, 5).setValue(fullEligibility.join(", "));
-
       return;
     }
 
